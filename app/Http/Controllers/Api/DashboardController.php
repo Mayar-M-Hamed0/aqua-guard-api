@@ -48,10 +48,10 @@ class DashboardController extends Controller
         $totalSamples = WaterSample::whereBetween('collection_date', [$dateFrom, $dateTo])->count();
         $activeAlerts = WaterAlert::where('is_resolved', false)->count();
         $criticalLocations = MonitoringLocation::active()
-            ->whereHas('samples', function($q) {
+            ->whereHas('samples', function ($q) {
                 $q->where('risk_level', 'critical')
-                  ->latest('collection_date')
-                  ->limit(1);
+                    ->latest('collection_date')
+                    ->limit(1);
             })
             ->count();
 
@@ -92,7 +92,7 @@ class DashboardController extends Controller
 
         return [
             'data' => $distribution,
-            'percentages' => array_map(function($count) use ($total) {
+            'percentages' => array_map(function ($count) use ($total) {
                 return $total > 0 ? round(($count / $total) * 100, 2) : 0;
             }, $distribution),
             'total' => $total,
@@ -135,7 +135,7 @@ class DashboardController extends Controller
             ->get();
 
         return [
-            'timeline' => $samples->map(function($item) {
+            'timeline' => $samples->map(function ($item) {
                 return [
                     'date' => $item->date,
                     'wqi_who' => round($item->avg_who, 2),
@@ -154,20 +154,22 @@ class DashboardController extends Controller
      */
     private function getTopContaminatedLocations($limit = 5): array
     {
-        return MonitoringLocation::with(['samples' => function($q) {
+        return MonitoringLocation::with([
+            'samples' => function ($q) {
                 $q->latest('collection_date')->limit(1);
-            }])
+            }
+        ])
             ->get()
-            ->filter(function($location) {
+            ->filter(function ($location) {
                 return $location->samples->isNotEmpty() &&
-                       in_array($location->samples->first()->risk_level, ['high', 'critical']);
+                    in_array($location->samples->first()->risk_level, ['high', 'critical']);
             })
-            ->sortByDesc(function($location) {
+            ->sortByDesc(function ($location) {
                 $sample = $location->samples->first();
                 return $sample->risk_level === 'critical' ? 2 : 1;
             })
             ->take($limit)
-            ->map(function($location) {
+            ->map(function ($location) {
                 $sample = $location->samples->first();
                 return [
                     'location_id' => $location->id,
@@ -195,7 +197,7 @@ class DashboardController extends Controller
             ->orderBy('created_at', 'desc')
             ->limit($limit)
             ->get()
-            ->map(function($alert) {
+            ->map(function ($alert) {
                 return [
                     'id' => $alert->id,
                     'severity' => $alert->severity,
@@ -223,28 +225,66 @@ class DashboardController extends Controller
             ->get();
 
         foreach ($samples as $sample) {
-            if (!empty($sample->risk_factors)) {
-                foreach ($sample->risk_factors as $risk) {
-                    $param = $risk['parameter'];
-                    if (!isset($violations[$param])) {
-                        $violations[$param] = [
-                            'parameter' => $param,
-                            'count' => 0,
-                            'severity_distribution' => [
-                                'critical' => 0,
-                                'high' => 0,
-                                'medium' => 0,
-                            ],
-                        ];
-                    }
-                    $violations[$param]['count']++;
-                    $violations[$param]['severity_distribution'][$risk['severity']]++;
+            if (empty($sample->risk_factors)) {
+                continue;
+            }
+
+            $riskFactors = $sample->risk_factors;
+
+            if (is_string($riskFactors)) {
+                $decoded = json_decode($riskFactors, true);
+
+                if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                    $riskFactors = $decoded;
+                } else {
+                    continue;
                 }
+            }
+
+            if (!is_array($riskFactors)) {
+                continue;
+            }
+
+            if (isset($riskFactors['parameter']) && isset($riskFactors['severity'])) {
+                $riskFactors = [$riskFactors];
+            }
+
+            foreach ($riskFactors as $risk) {
+                if (!is_array($risk)) {
+                    continue;
+                }
+
+                $param = $risk['parameter'] ?? null;
+                $severity = $risk['severity'] ?? null;
+
+                if (!$param || !$severity) {
+                    continue;
+                }
+
+                if (!isset($violations[$param])) {
+                    $violations[$param] = [
+                        'parameter' => $param,
+                        'count' => 0,
+                        'severity_distribution' => [
+                            'critical' => 0,
+                            'high' => 0,
+                            'medium' => 0,
+                        ],
+                    ];
+                }
+
+                if (!isset($violations[$param]['severity_distribution'][$severity])) {
+                    $violations[$param]['severity_distribution'][$severity] = 0;
+                }
+
+                $violations[$param]['count']++;
+                $violations[$param]['severity_distribution'][$severity]++;
             }
         }
 
+
         // Sort by count
-        usort($violations, function($a, $b) {
+        usort($violations, function ($a, $b) {
             return $b['count'] - $a['count'];
         });
 
@@ -257,12 +297,14 @@ class DashboardController extends Controller
     private function getLocationPerformance($dateFrom, $dateTo): array
     {
         $locations = MonitoringLocation::active()
-            ->with(['samples' => function($q) use ($dateFrom, $dateTo) {
-                $q->whereBetween('collection_date', [$dateFrom, $dateTo]);
-            }])
+            ->with([
+                'samples' => function ($q) use ($dateFrom, $dateTo) {
+                    $q->whereBetween('collection_date', [$dateFrom, $dateTo]);
+                }
+            ])
             ->get();
 
-        return $locations->map(function($location) {
+        return $locations->map(function ($location) {
             $samples = $location->samples;
 
             if ($samples->isEmpty()) {
@@ -284,10 +326,10 @@ class DashboardController extends Controller
                 'performance_score' => $this->calculatePerformanceScore($samples),
             ];
         })
-        ->filter()
-        ->sortByDesc('performance_score')
-        ->values()
-        ->toArray();
+            ->filter()
+            ->sortByDesc('performance_score')
+            ->values()
+            ->toArray();
     }
 
     /**
@@ -346,7 +388,8 @@ class DashboardController extends Controller
         foreach ($locationIds as $locationId) {
             $location = MonitoringLocation::find($locationId);
 
-            if (!$location) continue;
+            if (!$location)
+                continue;
 
             $latestSample = $location->samples()->latest('collection_date')->first();
 
@@ -374,7 +417,8 @@ class DashboardController extends Controller
     {
         $total = WaterSample::whereBetween('collection_date', [$dateFrom, $dateTo])->count();
 
-        if ($total === 0) return 0;
+        if ($total === 0)
+            return 0;
 
         $compliant = WaterSample::whereBetween('collection_date', [$dateFrom, $dateTo])
             ->whereIn('quality_status', ['excellent', 'good'])
@@ -397,8 +441,10 @@ class DashboardController extends Controller
 
         $change = $last - $first;
 
-        if ($change > 5) return 'improving';
-        if ($change < -5) return 'declining';
+        if ($change > 5)
+            return 'improving';
+        if ($change < -5)
+            return 'declining';
         return 'stable';
     }
 
@@ -407,11 +453,37 @@ class DashboardController extends Controller
      */
     private function calculatePerformanceScore($samples): float
     {
-        if ($samples->isEmpty()) return 0;
+        if ($samples->isEmpty()) {
+            return 0;
+        }
 
-        $avgWQI = $samples->avg('wqi_custom');
-        $consistencyScore = 100 - ($samples->pluck('wqi_custom')->values()->std() ?? 0);
+        $values = $samples->pluck('wqi_custom')
+            ->filter(fn($v) => $v !== null)
+            ->values()
+            ->all();
+
+        if (count($values) === 0) {
+            return 0;
+        }
+
+        $avgWQI = array_sum($values) / count($values);
+
+        if (count($values) > 1) {
+            $mean = $avgWQI;
+            $sumSquares = 0;
+
+            foreach ($values as $v) {
+                $sumSquares += pow($v - $mean, 2);
+            }
+
+            $std = sqrt($sumSquares / count($values));
+        } else {
+            $std = 0;
+        }
+
+        $consistencyScore = max(0, 100 - $std);
 
         return round(($avgWQI * 0.7) + ($consistencyScore * 0.3), 2);
     }
+
 }
