@@ -2,15 +2,20 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Exports\SamplesExport;
 use App\Http\Controllers\Controller;
+use App\Imports\SamplesImport;
 use App\Models\WaterSample;
 use App\Services\WQICalculatorService;
 use App\Services\AIAnalysisService;
+use App\Services\OBSService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
+use Maatwebsite\Excel\Facades\Excel;
 
 class WaterSampleController extends Controller
 {
@@ -61,11 +66,11 @@ class WaterSampleController extends Controller
         // Search
         if ($request->has('search')) {
             $search = $request->search;
-            $query->where(function($q) use ($search) {
+            $query->where(function ($q) use ($search) {
                 $q->where('sample_code', 'like', "%{$search}%")
-                  ->orWhereHas('location', function($q) use ($search) {
-                      $q->where('name', 'like', "%{$search}%");
-                  });
+                    ->orWhereHas('location', function ($q) use ($search) {
+                        $q->where('name', 'like', "%{$search}%");
+                    });
             });
         }
 
@@ -94,7 +99,7 @@ class WaterSampleController extends Controller
             'location',
             'collector',
             'verifier',
-            'alerts' => function($q) {
+            'alerts' => function ($q) {
                 $q->latest()->limit(10);
             }
         ])->findOrFail($id);
@@ -115,6 +120,9 @@ class WaterSampleController extends Controller
             'location_id' => 'required|exists:monitoring_locations,id',
             'collection_date' => 'required|date',
             'collection_time' => 'nullable|date_format:H:i',
+
+            // Image upload
+            'sample_image' => 'nullable|image|mimes:jpeg,png,jpg|max:5120', // 5MB max
 
             // At least one parameter is required
             'ph' => 'nullable|numeric|between:0,14',
@@ -155,13 +163,30 @@ class WaterSampleController extends Controller
             // Generate sample code
             $sampleCode = WaterSample::generateSampleCode();
 
+            // Handle image upload
+            $imageUrl = null;
+            if ($request->hasFile('sample_image')) {
+                $image = $request->file('sample_image');
+                $imageName = $sampleCode . '_' . time() . '.' . $image->getClientOriginalExtension();
+                $objectKey = 'water-samples/' . $imageName;
+
+                // Upload to OBS
+                $obsService = app(OBSService::class);
+                $uploadResult = $obsService->upload($image->getPathname(), $objectKey);
+
+                if ($uploadResult['HttpStatusCode'] === 200) {
+                    $imageUrl = $obsService->getUrl($objectKey);
+                }
+            }
+
             // Create sample
             $sample = WaterSample::create([
                 'sample_code' => $sampleCode,
                 'location_id' => $request->location_id,
-                'collected_by' => auth()->id(),
+                'collected_by' => auth()->id() ?? 1,
                 'collection_date' => $request->collection_date,
                 'collection_time' => $request->collection_time,
+                'sample_image_url' => $imageUrl,
 
                 // Physical
                 'temperature' => $request->temperature,
@@ -256,6 +281,10 @@ class WaterSampleController extends Controller
      * Update existing sample
      * PUT /api/samples/{id}
      */
+    /**
+     * Update existing sample
+     * PUT /api/samples/{id}
+     */
     public function update(Request $request, $id): JsonResponse
     {
         $sample = WaterSample::findOrFail($id);
@@ -269,10 +298,34 @@ class WaterSampleController extends Controller
         }
 
         $validator = Validator::make($request->all(), [
+            'location_id' => 'nullable|exists:monitoring_locations,id',
+            'collection_date' => 'nullable|date',
+            'collection_time' => 'nullable|date_format:H:i',
+
+            // Image upload
+            'sample_image' => 'nullable|image|mimes:jpeg,png,jpg|max:5120',
+            'delete_image' => 'nullable|boolean',
+
             'ph' => 'nullable|numeric|between:0,14',
             'temperature' => 'nullable|numeric',
             'turbidity' => 'nullable|numeric|min:0',
-            // ... same validation as store
+            'tds' => 'nullable|numeric|min:0',
+            'dissolved_oxygen' => 'nullable|numeric|min:0',
+            'bod' => 'nullable|numeric|min:0',
+            'cod' => 'nullable|numeric|min:0',
+            'nitrate' => 'nullable|numeric|min:0',
+            'nitrite' => 'nullable|numeric|min:0',
+            'ammonia' => 'nullable|numeric|min:0',
+            'phosphate' => 'nullable|numeric|min:0',
+            'total_coliform' => 'nullable|integer|min:0',
+            'fecal_coliform' => 'nullable|integer|min:0',
+            'e_coli' => 'nullable|integer|min:0',
+            'lead' => 'nullable|numeric|min:0',
+            'mercury' => 'nullable|numeric|min:0',
+            'arsenic' => 'nullable|numeric|min:0',
+            'cadmium' => 'nullable|numeric|min:0',
+            'lab_name' => 'nullable|string|max:255',
+            'notes' => 'nullable|string',
         ]);
 
         if ($validator->fails()) {
@@ -284,45 +337,144 @@ class WaterSampleController extends Controller
 
         DB::beginTransaction();
         try {
-            $sample->update($request->only([
-                'temperature', 'turbidity', 'ph', 'tds', 'dissolved_oxygen',
-                'bod', 'cod', 'nitrate', 'nitrite', 'ammonia', 'phosphate',
-                'total_coliform', 'fecal_coliform', 'e_coli',
-                'lead', 'mercury', 'arsenic', 'cadmium',
-                'lab_name', 'notes'
-            ]));
+            $obsService = app(OBSService::class);
 
-            // Recalculate WQI
-            $wqiResults = $this->wqiCalculator->calculateAllWQI($sample);
-            $sample->update($wqiResults);
-
-            // Re-run AI Analysis
-            try {
-                $aiResults = $this->aiAnalysis->analyze($sample);
-                $sample->update([
-                    'ai_predictions' => $aiResults['predictions'],
-                    'ai_confidence' => $aiResults['confidence'],
-                    'ai_recommendations' => $aiResults['recommendations'],
-                ]);
-            } catch (\Exception $e) {
-                Log::warning('AI Analysis failed: ' . $e->getMessage());
+            // Handle image deletion
+            if ($request->has('delete_image') && $request->delete_image == true) {
+                if ($sample->sample_image_url) {
+                    // Extract object key from URL
+                    $objectKey = $this->extractObjectKeyFromUrl($sample->sample_image_url);
+                    if ($objectKey) {
+                        try {
+                            $obsService->delete($objectKey);
+                        } catch (\Exception $e) {
+                            Log::warning('Failed to delete old image from OBS: ' . $e->getMessage());
+                        }
+                    }
+                    $sample->sample_image_url = null;
+                }
             }
+
+            // Handle new image upload
+            if ($request->hasFile('sample_image')) {
+                // Delete old image if exists
+                if ($sample->sample_image_url) {
+                    $objectKey = $this->extractObjectKeyFromUrl($sample->sample_image_url);
+                    if ($objectKey) {
+                        try {
+                            $obsService->delete($objectKey);
+                        } catch (\Exception $e) {
+                            Log::warning('Failed to delete old image from OBS: ' . $e->getMessage());
+                        }
+                    }
+                }
+
+                // Upload new image
+                $image = $request->file('sample_image');
+                $imageName = $sample->sample_code . '_' . time() . '.' . $image->getClientOriginalExtension();
+                $objectKey = 'water-samples/' . $imageName;
+
+                $uploadResult = $obsService->upload($image->getPathname(), $objectKey);
+
+                if ($uploadResult['HttpStatusCode'] === 200) {
+                    $sample->sample_image_url = $obsService->getUrl($objectKey);
+                } else {
+                    throw new \Exception('Failed to upload image to OBS');
+                }
+            }
+
+            // Update all other fields
+            $sample->fill($request->except(['sample_image', 'delete_image', '_method']));
+
+            // If any water quality parameters changed, recalculate WQI
+            if ($this->hasWaterQualityParametersChanged($request)) {
+                $wqiResults = $this->wqiCalculator->calculateAllWQI($sample);
+                $sample->fill($wqiResults);
+
+                // Re-run AI Analysis if parameters changed
+                try {
+                    $aiResults = $this->aiAnalysis->analyze($sample);
+                    $sample->ai_predictions = $aiResults['predictions'];
+                    $sample->ai_confidence = $aiResults['confidence'];
+                    $sample->ai_recommendations = $aiResults['recommendations'];
+                } catch (\Exception $e) {
+                    Log::warning('AI Analysis failed during update: ' . $e->getMessage());
+                }
+            }
+
+            $sample->save();
+
+            // Update alerts if needed
+            $this->createAlertsIfNeeded($sample);
 
             DB::commit();
 
             return response()->json([
                 'success' => true,
                 'message' => 'Sample updated successfully',
-                'data' => $sample->fresh(['location', 'collector']),
-            ]);
+                'data' => $sample->load(['location', 'collector']),
+            ], 200);
 
         } catch (\Exception $e) {
             DB::rollBack();
+            Log::error('Sample update error: ' . $e->getMessage());
+
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to update sample: ' . $e->getMessage()
             ], 500);
         }
+    }
+
+    /**
+     * Extract object key from OBS URL
+     */
+    private function extractObjectKeyFromUrl($url)
+    {
+        // Example URL: https://bucket-name.obs.region.myhuaweicloud.com/water-samples/WS-001_123456.jpg
+        // Extract: water-samples/WS-001_123456.jpg
+
+        $parsed = parse_url($url);
+        if (isset($parsed['path'])) {
+            // Remove leading slash
+            return ltrim($parsed['path'], '/');
+        }
+        return null;
+    }
+
+    /**
+     * Check if water quality parameters changed
+     */
+    private function hasWaterQualityParametersChanged(Request $request)
+    {
+        $wqiParameters = [
+            'ph',
+            'temperature',
+            'turbidity',
+            'tds',
+            'dissolved_oxygen',
+            'bod',
+            'cod',
+            'nitrate',
+            'nitrite',
+            'ammonia',
+            'phosphate',
+            'total_coliform',
+            'fecal_coliform',
+            'e_coli',
+            'lead',
+            'mercury',
+            'arsenic',
+            'cadmium'
+        ];
+
+        foreach ($wqiParameters as $param) {
+            if ($request->has($param)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -334,7 +486,7 @@ class WaterSampleController extends Controller
         $sample = WaterSample::findOrFail($id);
 
         // Only admin can delete verified samples
-        if ($sample->status === 'verified' && !auth()->user()->hasRole('admin')) {
+        if ($sample->status === 'verified') {
             return response()->json([
                 'success' => false,
                 'message' => 'Only admin can delete verified samples'
@@ -349,10 +501,6 @@ class WaterSampleController extends Controller
         ]);
     }
 
-    /**
-     * Verify sample (for quality control)
-     * POST /api/samples/{id}/verify
-     */
     public function verify($id): JsonResponse
     {
         $sample = WaterSample::findOrFail($id);
@@ -397,7 +545,7 @@ class WaterSampleController extends Controller
 
         try {
             // Import logic using Maatwebsite\Excel
-            $imported = \Excel::import(new WaterSamplesImport($request->location_id), $request->file('file'));
+            $imported = \Excel::import(new SamplesImport($request->location_id), $request->file('file'));
 
             return response()->json([
                 'success' => true,
@@ -432,7 +580,7 @@ class WaterSampleController extends Controller
         }
 
         // Get latest sample per location for map
-        $samples = $query->get()->groupBy('location_id')->map(function($group) {
+        $samples = $query->get()->groupBy('location_id')->map(function ($group) {
             return $group->sortByDesc('collection_date')->first();
         })->values();
 
@@ -461,4 +609,64 @@ class WaterSampleController extends Controller
             }
         }
     }
+
+    public function bulkDelete(Request $request)
+    {
+        $validated = $request->validate([
+            'ids' => 'required|array',
+            'ids.*' => 'exists:samples,id'
+        ]);
+
+        WaterSample::whereIn('id', $validated['ids'])->delete();
+
+        return response()->json([
+            'success' => true,
+            'message' => count($validated['ids']) . ' samples deleted successfully'
+        ]);
+    }
+
+    public function bulkUpdate(Request $request)
+    {
+        $validated = $request->validate([
+            'ids' => 'required|array',
+            'ids.*' => 'exists:samples,id',
+            'data' => 'required|array'
+        ]);
+
+        WaterSample::whereIn('id', $validated['ids'])
+            ->update($validated['data']);
+
+        return response()->json([
+            'success' => true,
+            'message' => count($validated['ids']) . ' samples updated successfully'
+        ]);
+    }
+
+    public function export(Request $request)
+    {
+        // تمرير الـ filters بدلاً من الـ samples
+        $filters = [
+            'sample_id' => $request->sample_id,
+            // أي filters أخرى
+        ];
+
+        return Excel::download(new SamplesExport($filters), 'water-samples.xlsx');
+    }
+
+    public function statistics(Request $request)
+    {
+        $stats = [
+            'total' => WaterSample::count(),
+            'by_status' => WaterSample::groupBy('quality_status')
+                ->selectRaw('quality_status, count(*) as count')
+                ->pluck('count', 'quality_status'),
+            'by_risk' => WaterSample::groupBy('risk_level')
+                ->selectRaw('risk_level, count(*) as count')
+                ->pluck('count', 'risk_level'),
+            'average_wqi' => WaterSample::avg('wqi_who'),
+        ];
+
+        return response()->json($stats);
+    }
+
 }

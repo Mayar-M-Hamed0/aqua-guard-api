@@ -18,6 +18,7 @@ class WaterSample extends Model
         'collected_by',
         'collection_date',
         'collection_time',
+        'sample_image_url',
 
         // Physical
         'temperature',

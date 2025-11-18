@@ -50,6 +50,10 @@ Route::prefix('samples')->group(function () {
     Route::post('/', [WaterSampleController::class, 'store']);
     Route::get('/map-data', [WaterSampleController::class, 'mapData']);
     Route::post('/import', [WaterSampleController::class, 'import']);
+    Route::delete('/bulk', [WaterSampleController::class, 'bulkDelete']);
+    Route::put('/bulk', [WaterSampleController::class, 'bulkUpdate']);
+    Route::get('/export', [WaterSampleController::class, 'export']);
+    Route::get('/statistics', [WaterSampleController::class, 'statistics']);
     Route::get('/{id}', [WaterSampleController::class, 'show']);
     Route::put('/{id}', [WaterSampleController::class, 'update']);
     Route::delete('/{id}', [WaterSampleController::class, 'destroy']);
@@ -67,6 +71,7 @@ Route::prefix('analysis')->group(function () {
 // Alerts
 Route::prefix('alerts')->group(function () {
     Route::get('/', [AlertController::class, 'index']);
+    Route::get('/statistics', [AlertController::class, 'statistics']);
     Route::get('/unread', [AlertController::class, 'unread']);
     Route::post('/{id}/mark-read', [AlertController::class, 'markAsRead']);
     Route::post('/{id}/resolve', [AlertController::class, 'resolve']);
@@ -76,7 +81,7 @@ Route::prefix('alerts')->group(function () {
 // Reports
 Route::prefix('reports')->group(function () {
     Route::get('/', [ReportController::class, 'index']);
-    Route::get('templates',[ReportController::class, 'templates']);
+    Route::get('templates', [ReportController::class, 'templates']);
     Route::post('/generate', [ReportController::class, 'generate']);
     Route::get('/{id}', [ReportController::class, 'show']);
     Route::get('/{id}/download', [ReportController::class, 'download']);
